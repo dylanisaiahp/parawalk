@@ -21,8 +21,9 @@ fn walks_tmp_dir() {
         tmp.clone(),
         WalkConfig::default(),
         None::<fn(&parawalk::EntryRef<'_>) -> bool>,
-        move |entry| {
-            results_clone.lock().unwrap().push(entry);
+        move || {
+            let r = Arc::clone(&results_clone);
+            move |entry| { r.lock().unwrap().push(entry); }
         },
     );
 
@@ -47,9 +48,12 @@ fn pre_filter_skips_non_matching() {
     walk(
         tmp.clone(),
         WalkConfig::default(),
-        Some(|entry: &parawalk::EntryRef<'_>| entry.name.to_string_lossy().contains("invoice")),
-        move |entry| {
-            results_clone.lock().unwrap().push(entry.path);
+        Some(|entry: &parawalk::EntryRef<'_>| {
+            entry.name.to_string_lossy().contains("invoice")
+        }),
+        move || {
+            let r = Arc::clone(&results_clone);
+            move |entry: parawalk::Entry| { r.lock().unwrap().push(entry.path); }
         },
     );
 
@@ -73,13 +77,11 @@ fn respects_max_depth() {
 
     walk(
         tmp.clone(),
-        WalkConfig {
-            max_depth: Some(1),
-            ..WalkConfig::default()
-        },
+        WalkConfig { max_depth: Some(1), ..WalkConfig::default() },
         None::<fn(&parawalk::EntryRef<'_>) -> bool>,
-        move |entry| {
-            results_clone.lock().unwrap().push(entry);
+        move || {
+            let r = Arc::clone(&results_clone);
+            move |entry| { r.lock().unwrap().push(entry); }
         },
     );
 

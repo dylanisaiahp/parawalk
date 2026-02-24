@@ -18,7 +18,10 @@
 //!     "/usr".into(),
 //!     WalkConfig::default(),
 //!     None::<fn(&EntryRef<'_>) -> bool>,
-//!     move |entry: Entry| { let _ = tx.send(entry); },
+//!     move || {
+//!         let tx = tx.clone();
+//!         move |entry: Entry| { let _ = tx.send(entry); }
+//!     },
 //! );
 //!
 //! let count = rx.into_iter().count();
@@ -123,14 +126,17 @@ struct DirJob {
 /// * `config` - Walk configuration (threads, depth, symlinks).
 /// * `pre_filter` - Optional cheap filter on [`EntryRef`] (filename + kind).
 ///   Return `true` to materialize and visit the entry, `false` to skip.
-/// * `visitor` - Called for each entry that passes the pre-filter.
-pub fn walk<F, P>(root: PathBuf, config: WalkConfig, pre_filter: Option<P>, visitor: F)
+/// * `visitor_factory` - Called once per thread to produce a per-thread visitor.
+///   Each thread gets its own visitor instance — no shared state, no locking.
+///   This mirrors `ignore`'s `build_parallel().run(|| Box::new(...))` pattern.
+pub fn walk<F, V, P>(root: PathBuf, config: WalkConfig, pre_filter: Option<P>, visitor_factory: F)
 where
-    F: Fn(Entry) + Send + Sync + 'static,
+    F: Fn() -> V + Send + Sync + 'static,
+    V: FnMut(Entry) + Send + 'static,
     P: Fn(&EntryRef<'_>) -> bool + Send + Sync + 'static,
 {
     let injector = Arc::new(Injector::<DirJob>::new());
-    let visitor = Arc::new(visitor);
+    let visitor_factory = Arc::new(visitor_factory);
     let pre_filter: Option<Arc<P>> = pre_filter.map(Arc::new);
 
     // Seed the root job
@@ -152,13 +158,13 @@ where
         for worker in workers {
             let injector = Arc::clone(&injector);
             let stealers = Arc::clone(&stealers);
-            let visitor = Arc::clone(&visitor);
             let pre_filter = pre_filter.clone();
             let active = Arc::clone(&active);
+            // Each thread gets its own visitor — no sharing, no locking
+            let mut visitor = visitor_factory();
 
             s.spawn(move || {
                 loop {
-                    // Try local first, then steal from others, then global injector
                     let job = worker.pop().or_else(|| {
                         stealers
                             .iter()
@@ -173,7 +179,7 @@ where
                                 job,
                                 &worker,
                                 &injector,
-                                &visitor,
+                                &mut visitor,
                                 pre_filter.as_ref(),
                                 max_depth,
                                 follow_links,
@@ -181,11 +187,9 @@ where
                             active.fetch_sub(1, Ordering::Relaxed);
                         }
                         None => {
-                            // No work found — check if truly done
                             if active.load(Ordering::Relaxed) == 0
                                 && injector.is_empty()
                             {
-                                // Double-check after a yield to avoid false exit
                                 std::thread::yield_now();
                                 if active.load(Ordering::Relaxed) == 0
                                     && injector.is_empty()
@@ -207,16 +211,16 @@ where
 // process_dir
 // ---------------------------------------------------------------------------
 
-fn process_dir<F, P>(
+fn process_dir<V, P>(
     job: DirJob,
     worker: &Worker<DirJob>,
     _injector: &Injector<DirJob>,
-    visitor: &Arc<F>,
+    visitor: &mut V,
     pre_filter: Option<&Arc<P>>,
     max_depth: Option<usize>,
     follow_links: bool,
 ) where
-    F: Fn(Entry) + Send + Sync,
+    V: FnMut(Entry),
     P: Fn(&EntryRef<'_>) -> bool + Send + Sync,
 {
     let read = match fs::read_dir(&job.path) {
