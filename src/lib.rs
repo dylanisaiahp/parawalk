@@ -134,10 +134,7 @@ where
     let pre_filter: Option<Arc<P>> = pre_filter.map(Arc::new);
 
     // Seed the root job
-    injector.push(DirJob {
-        path: root,
-        depth: 0,
-    });
+    injector.push(DirJob { path: root, depth: 0 });
 
     let n = config.threads.max(1);
     let max_depth = config.max_depth;
@@ -171,7 +168,7 @@ where
 
                     match job {
                         Some(job) => {
-                            active.fetch_add(1, Ordering::SeqCst);
+                            active.fetch_add(1, Ordering::Relaxed);
                             process_dir(
                                 job,
                                 &worker,
@@ -181,14 +178,23 @@ where
                                 max_depth,
                                 follow_links,
                             );
-                            active.fetch_sub(1, Ordering::SeqCst);
+                            active.fetch_sub(1, Ordering::Relaxed);
                         }
                         None => {
-                            // No work found — exit if truly idle
-                            if active.load(Ordering::SeqCst) == 0 && injector.is_empty() {
-                                break;
+                            // No work found — check if truly done
+                            if active.load(Ordering::Relaxed) == 0
+                                && injector.is_empty()
+                            {
+                                // Double-check after a yield to avoid false exit
+                                std::thread::yield_now();
+                                if active.load(Ordering::Relaxed) == 0
+                                    && injector.is_empty()
+                                {
+                                    break;
+                                }
+                            } else {
+                                std::thread::yield_now();
                             }
-                            std::hint::spin_loop();
                         }
                     }
                 }
@@ -251,32 +257,19 @@ fn process_dir<F, P>(
 
         // Cheap pre-filter — runs on borrowed &OsStr, zero allocation
         let pass = pre_filter
-            .map(|f| {
-                f(&EntryRef {
-                    name: &name,
-                    depth,
-                    kind: kind.clone(),
-                })
-            })
+            .map(|f| f(&EntryRef { name: &name, depth, kind: kind.clone() }))
             .unwrap_or(true);
 
         if pass {
             // Only materialize full PathBuf for entries that pass the filter
             let path = job.path.join(&name);
-            visitor(Entry {
-                path,
-                kind: kind.clone(),
-                depth,
-            });
+            visitor(Entry { path, kind: kind.clone(), depth });
         }
 
         // Push subdirectories as new jobs regardless of filter
         // (we always recurse, just don't emit filtered dirs to visitor)
         if is_dir && max_depth.map(|d| depth < d).unwrap_or(true) {
-            let sub = DirJob {
-                path: job.path.join(&name),
-                depth,
-            };
+            let sub = DirJob { path: job.path.join(&name), depth };
             worker.push(sub);
         }
     }
