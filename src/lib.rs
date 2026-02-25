@@ -102,12 +102,22 @@ pub struct EntryRef<'a> {
 }
 
 // ---------------------------------------------------------------------------
-// Internal job type
+// Internal types
 // ---------------------------------------------------------------------------
 
 struct DirJob {
     path: PathBuf,
     depth: usize,
+}
+
+/// Shared walk context passed to process_dir — avoids too-many-arguments.
+struct WalkCtx<P> {
+    worker: Worker<DirJob>,
+    injector: Arc<Injector<DirJob>>,
+    pending: Arc<AtomicUsize>,
+    pre_filter: Option<Arc<P>>,
+    max_depth: Option<usize>,
+    follow_links: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -140,7 +150,10 @@ where
     let pre_filter: Option<Arc<P>> = pre_filter.map(Arc::new);
 
     // Seed the root job
-    injector.push(DirJob { path: root, depth: 0 });
+    injector.push(DirJob {
+        path: root,
+        depth: 0,
+    });
 
     let n = config.threads.max(1);
     let max_depth = config.max_depth;
@@ -151,54 +164,51 @@ where
     let stealers: Arc<Vec<Stealer<DirJob>>> =
         Arc::new(workers.iter().map(|w| w.stealer()).collect());
 
-    // Active job counter — when it hits zero all threads can exit
-    let active = Arc::new(AtomicUsize::new(0));
+    // Pending job counter — counts jobs that exist but haven't completed yet.
+    // Initialized to 1 for the root job. Incremented BEFORE pushing each child
+    // job, decremented AFTER process_dir returns. When it hits zero, the walk
+    // is truly done — no jobs exist anywhere, in any thread's local queue or
+    // the global injector.
+    let pending = Arc::new(AtomicUsize::new(1));
 
     std::thread::scope(|s| {
         for worker in workers {
             let injector = Arc::clone(&injector);
             let stealers = Arc::clone(&stealers);
             let pre_filter = pre_filter.clone();
-            let active = Arc::clone(&active);
-            // Each thread gets its own visitor — no sharing, no locking
+            let pending = Arc::clone(&pending);
             let mut visitor = visitor_factory();
 
             s.spawn(move || {
+                let ctx = WalkCtx {
+                    worker,
+                    injector,
+                    pending,
+                    pre_filter,
+                    max_depth,
+                    follow_links,
+                };
+
                 loop {
-                    let job = worker.pop().or_else(|| {
+                    let job = ctx.worker.pop().or_else(|| {
                         stealers
                             .iter()
                             .find_map(|s| s.steal().success())
-                            .or_else(|| injector.steal().success())
+                            .or_else(|| ctx.injector.steal().success())
                     });
 
                     match job {
                         Some(job) => {
-                            active.fetch_add(1, Ordering::Relaxed);
-                            process_dir(
-                                job,
-                                &worker,
-                                &injector,
-                                &mut visitor,
-                                pre_filter.as_ref(),
-                                max_depth,
-                                follow_links,
-                            );
-                            active.fetch_sub(1, Ordering::Relaxed);
+                            process_dir(job, &mut visitor, &ctx);
+                            // This job is complete. If we were the last pending
+                            // job, all threads will see pending == 0 and exit.
+                            ctx.pending.fetch_sub(1, Ordering::Release);
                         }
                         None => {
-                            if active.load(Ordering::Relaxed) == 0
-                                && injector.is_empty()
-                            {
-                                std::thread::yield_now();
-                                if active.load(Ordering::Relaxed) == 0
-                                    && injector.is_empty()
-                                {
-                                    break;
-                                }
-                            } else {
-                                std::thread::yield_now();
+                            if ctx.pending.load(Ordering::Acquire) == 0 {
+                                break;
                             }
+                            std::thread::yield_now();
                         }
                     }
                 }
@@ -211,15 +221,8 @@ where
 // process_dir
 // ---------------------------------------------------------------------------
 
-fn process_dir<V, P>(
-    job: DirJob,
-    worker: &Worker<DirJob>,
-    _injector: &Injector<DirJob>,
-    visitor: &mut V,
-    pre_filter: Option<&Arc<P>>,
-    max_depth: Option<usize>,
-    follow_links: bool,
-) where
+fn process_dir<V, P>(job: DirJob, visitor: &mut V, ctx: &WalkCtx<P>)
+where
     V: FnMut(Entry),
     P: Fn(&EntryRef<'_>) -> bool + Send + Sync,
 {
@@ -240,7 +243,7 @@ fn process_dir<V, P>(
         };
 
         let is_symlink = file_type.is_symlink();
-        let is_dir = if is_symlink && follow_links {
+        let is_dir = if is_symlink && ctx.follow_links {
             raw.path().is_dir()
         } else {
             file_type.is_dir()
@@ -260,21 +263,35 @@ fn process_dir<V, P>(
         let name = raw.file_name();
 
         // Cheap pre-filter — runs on borrowed &OsStr, zero allocation
-        let pass = pre_filter
-            .map(|f| f(&EntryRef { name: &name, depth, kind: kind.clone() }))
+        let pass = ctx
+            .pre_filter
+            .as_ref()
+            .map(|f| {
+                f(&EntryRef {
+                    name: &name,
+                    depth,
+                    kind: kind.clone(),
+                })
+            })
             .unwrap_or(true);
 
         if pass {
-            // Only materialize full PathBuf for entries that pass the filter
             let path = job.path.join(&name);
-            visitor(Entry { path, kind: kind.clone(), depth });
+            visitor(Entry {
+                path,
+                kind: kind.clone(),
+                depth,
+            });
         }
 
         // Push subdirectories as new jobs regardless of filter
-        // (we always recurse, just don't emit filtered dirs to visitor)
-        if is_dir && max_depth.map(|d| depth < d).unwrap_or(true) {
-            let sub = DirJob { path: job.path.join(&name), depth };
-            worker.push(sub);
+        if is_dir && ctx.max_depth.map(|d| depth < d).unwrap_or(true) {
+            // Increment BEFORE pushing so pending is never zero while work exists
+            ctx.pending.fetch_add(1, Ordering::Relaxed);
+            ctx.worker.push(DirJob {
+                path: job.path.join(&name),
+                depth,
+            });
         }
     }
 }

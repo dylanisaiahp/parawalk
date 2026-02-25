@@ -1,6 +1,6 @@
 [package]
 name = "parawalk"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2024"
 description = "Blazing-fast parallel directory walker with zero filtering baggage"
 license = "MIT"
